@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Log & runtime
+*.log
+logs/
+*.jsonl
+
+# Model & cache (jangan commit model besar)
+models/
+*.bin
+*.pt
+*.onnx
+.cache/
+huggingface/
+
+# Audio ujian
+audio/
+*.wav
+*.mp3
+*.m4a
+*.opus
+*.webm
+
+# Environment & secret
+.env
+.env.*
+*.key
+secrets/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+fat/test.sh
