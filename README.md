@@ -15,12 +15,12 @@ Repo ini mengandungi tiga varian Whisper. Setiap varian ialah satu Docker image 
 ```bash
 docker run -d --name whisper \
   --gpus all \
-  -p 8319:8000 \
+  -p 8304:8000 \
   -v /path/to/audio:/audio \
   -v /path/to/logs:/app/logs \
   xchaix74/whisper:fat
 bash
-curl -X POST http://127.0.0.1:8319/v1/audio/transcriptions \
+curl -X POST http://127.0.0.1:8304/v1/audio/transcriptions \
   -F "file=@audio.m4a" \
   -F "language=en"
 Respons:
