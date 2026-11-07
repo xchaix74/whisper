@@ -1,0 +1,44 @@
+# fat 1.1.0 — config default
+# Ubah nilai di sini, atau mount override ke /app/config.yaml
+# Semua nilai boleh diubah tanpa rebuild image (restart container sahaja)
+
+server:
+  # Maksimum saiz fail (MB). 2048 = 2GB, cukup untuk audio 2j+.
+  max_file_mb: 2048
+  # Timeout per request (saat). Untuk audio panjang, chunking ambil masa.
+  # 900s = 15 minit, cukup untuk 2j audio (12 chunk × ~90s).
+  request_timeout_s: 900
+  # Queue depth (bilangan request serentak).
+  queue_max: 32
+
+chunking:
+  # Aktifkan chunking untuk audio > chunk_seconds.
+  enabled: true
+  # Saiz chunk (saat). 300 = 5 minit.
+  # Audio ≤ ini diproses terus. Audio > ini di-chunk.
+  chunk_seconds: 300
+  # VAD: senyap minimum (ms) untuk potong chunk.
+  min_silence_ms: 500
+  # VAD: threshold (0.0-1.0). 0.5 = default Silero.
+  # Lebih tinggi = lebih agresif buang bukan-pertuturan.
+  vad_threshold: 0.5
+
+transcription:
+  # word_timestamps default (false = lebih laju, tiada start/end per perkataan).
+  word_timestamps_default: false
+  # condition_on_previous_text (false = elak repetition loop).
+  condition_on_previous_text: false
+  # Beam size (5 = default, lebih tinggi = lebih tepat tetapi lambat).
+  beam_size: 5
+
+confidence_gate:
+  # Buang segmen yang model sendiri tak yakin.
+  enabled: true
+  # no_speech_prob > ini DAN avg_logprob < avg_logprob_min → buang.
+  no_speech_prob_max: 0.6
+  avg_logprob_min: -1.0
+
+repetition_guard:
+  # Potong frasa berulang >3 kali berturut-turut.
+  enabled: true
+  max_repeats: 3
