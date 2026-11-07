@@ -48,7 +48,7 @@ curl -X POST http://127.0.0.1:8304/v1/audio/transcriptions \
 
 ---
 
-## Whisper — CikguSayang ASR (English, full documentation)
+# Whisper — CikguSayang ASR (English)
 
 Three Docker images for speech-to-text, built for CikguSayang — a free, OSS mobile AI language tutor. All variants share the same API: `POST /v1/audio/transcriptions`.
 
