@@ -10,6 +10,10 @@ server:
   request_timeout_s: 900
   # Queue depth (bilangan request serentak).
   queue_max: 32
+  # 0 = tiada had. Jika >0, audio > max_duration_s ditolak 413 (untuk CS real-time).
+  max_duration_s: 0
+  # Timeout GPU lock untuk fast queue (saat). Jika penuh, pulang 503.
+  fast_gpu_timeout_s: 30
 
 chunking:
   # Aktifkan chunking untuk audio > chunk_seconds.
@@ -22,6 +26,8 @@ chunking:
   # VAD: threshold (0.0-1.0). 0.5 = default Silero.
   # Lebih tinggi = lebih agresif buang bukan-pertuturan.
   vad_threshold: 0.5
+  # Timeout per chunk (saat). Elak satu chunk tersangkut block queue.
+  chunk_timeout_s: 180
 
 transcription:
   # word_timestamps default (false = lebih laju, tiada start/end per perkataan).

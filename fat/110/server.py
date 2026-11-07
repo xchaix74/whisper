@@ -1,26 +1,14 @@
 """FastAPI server untuk Whisper FAT 1.1.0 (CikguSayang).
 
-Ciri baharu berbanding 1.0.0:
-  - Chunking automatik untuk audio >5 minit (fixed chunk, sliding pada senyap)
+Ciri:
+  - Chunking automatik untuk audio >5 minit (fixed 5 min, sliding pada senyap)
+  - Queue separation: fast (pendek) vs slow (panjang), GPU lock per chunk
   - Confidence gate (buang segmen low-confidence)
   - Repetition guard (potong frasa >3×)
   - Validasi PyAV (400 untuk fail rosak)
   - Config YAML (boleh ubah tanpa rebuild)
-  - word_timestamps + initial_prompt parameter
-  - Had saiz: 100MB → 2GB
-  - Timeout: 120s → 900s
-
-Endpoint OpenAI-compatible:
-  POST /v1/audio/transcriptions
-    form: file (wajib), language (pilihan), task (pilihan)
-    query: word_timestamps (pilihan), initial_prompt (pilihan), vad_threshold (pilihan)
-    response: {"text": "...", "language": "...", "language_probability": ...}
-
-Health:
-  GET /health
-
-Log:
-  JSONL ke /app/logs/whisper.jsonl (mount volume untuk persist).
+  - word_timestamps + initial_prompt + vad_threshold + max_duration parameter
+  - Had saiz: 2GB, timeout server: 900s
 """
 
 import asyncio
@@ -32,7 +20,6 @@ import re
 import time
 import uuid
 from datetime import datetime, timezone
-from pathlib import Path
 
 import av
 import yaml
@@ -46,12 +33,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger("whisper.server")
 
-# --- Baca config ---
+
+# --- Config ---
 def load_config() -> dict:
-    """Baca config dari WHISPER_CONFIG (override) atau /app/config.yaml (default)."""
     default = {
-        "server": {"max_file_mb": 2048, "request_timeout_s": 900, "queue_max": 32},
-        "chunking": {"enabled": True, "chunk_seconds": 300, "min_silence_ms": 500, "vad_threshold": 0.5},
+        "server": {"max_file_mb": 2048, "request_timeout_s": 900, "queue_max": 32,
+                   "max_duration_s": 0, "fast_gpu_timeout_s": 30},
+        "chunking": {"enabled": True, "chunk_seconds": 300, "min_silence_ms": 500,
+                     "vad_threshold": 0.5, "chunk_timeout_s": 180},
         "transcription": {"word_timestamps_default": False, "condition_on_previous_text": False, "beam_size": 5},
         "confidence_gate": {"enabled": True, "no_speech_prob_max": 0.6, "avg_logprob_min": -1.0},
         "repetition_guard": {"enabled": True, "max_repeats": 3},
@@ -60,7 +49,6 @@ def load_config() -> dict:
     try:
         with open(path, "r", encoding="utf-8") as f:
             user = yaml.safe_load(f) or {}
-        # Deep merge: user override default
         for section, values in user.items():
             if isinstance(values, dict) and section in default:
                 default[section].update(values)
@@ -73,6 +61,7 @@ def load_config() -> dict:
         logger.error("Gagal baca config %s: %s, guna default", path, e)
     return default
 
+
 CFG = load_config()
 VERSION = os.environ.get("WHISPER_VERSION", "1.1.0")
 LOG_DIR = os.environ.get("WHISPER_LOG_DIR", "/app/logs")
@@ -82,11 +71,14 @@ os.makedirs(LOG_DIR, exist_ok=True)
 MAX_FILE_BYTES = int(CFG["server"]["max_file_mb"]) * 1024 * 1024
 REQUEST_TIMEOUT = float(CFG["server"]["request_timeout_s"])
 QUEUE_MAX = int(CFG["server"]["queue_max"])
+MAX_DURATION_DEFAULT = float(CFG["server"].get("max_duration_s", 0))
+FAST_GPU_TIMEOUT = float(CFG["server"].get("fast_gpu_timeout_s", 30))
 
-CHUNK_SECONDS = float(CFG["chunking"]["chunk_seconds"])
 CHUNK_ENABLED = bool(CFG["chunking"]["enabled"])
+CHUNK_SECONDS = float(CFG["chunking"]["chunk_seconds"])
 MIN_SILENCE_MS = int(CFG["chunking"]["min_silence_ms"])
 VAD_THRESHOLD = float(CFG["chunking"]["vad_threshold"])
+CHUNK_TIMEOUT = float(CFG["chunking"].get("chunk_timeout_s", 180))
 
 WORD_TS_DEFAULT = bool(CFG["transcription"]["word_timestamps_default"])
 COND_PREV_TEXT = bool(CFG["transcription"]["condition_on_previous_text"])
@@ -100,8 +92,9 @@ REP_ENABLED = bool(CFG["repetition_guard"]["enabled"])
 REP_MAX = int(CFG["repetition_guard"]["max_repeats"])
 
 logger.info("Version: %s", VERSION)
-logger.info("Config: max_file=%dMB, timeout=%ds, chunk=%ds, queue=%d",
-            MAX_FILE_BYTES // (1024*1024), int(REQUEST_TIMEOUT), int(CHUNK_SECONDS), QUEUE_MAX)
+logger.info("Config: max_file=%dMB, timeout=%ds, chunk=%ds, queue=%d, max_dur=%ds, chunk_timeout=%ds",
+            MAX_FILE_BYTES // (1024 * 1024), int(REQUEST_TIMEOUT), int(CHUNK_SECONDS),
+            QUEUE_MAX, int(MAX_DURATION_DEFAULT), int(CHUNK_TIMEOUT))
 
 # --- Model ---
 MODEL_ID = os.environ.get("WHISPER_MODEL", "large-v3-turbo")
@@ -112,12 +105,12 @@ logger.info("Model loaded")
 
 # --- Locks ---
 _gpu_lock = asyncio.Lock()
-_queue_sem = asyncio.Semaphore(QUEUE_MAX)
+_fast_sem = asyncio.Semaphore(max(1, QUEUE_MAX // 2))
+_slow_sem = asyncio.Semaphore(max(1, QUEUE_MAX // 2))
+
 
 # --- Helpers ---
-
 def _write_log(entry: dict) -> None:
-    """Tulis satu baris JSONL ke log fail."""
     try:
         with open(LOG_FILE, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
@@ -126,7 +119,6 @@ def _write_log(entry: dict) -> None:
 
 
 def _vram_mb() -> float:
-    """Baca VRAM terpakai dari nvidia-smi (MB). Fallback: -1 jika gagal."""
     try:
         import subprocess
         out = subprocess.check_output(
@@ -153,27 +145,23 @@ def validate_audio(audio_bytes: bytes) -> float:
         raise ValueError(f"fail audio rosak: {e}")
 
 
-def find_silence_points(audio_bytes: bytes, min_silence_ms: int) -> list[float]:
-    """Cari titik senyap (saat) menggunakan PyAV energy threshold ringkas.
-    Pulang senarai timestamp (saat) di mana senyap berlaku.
-    Nota: ini bukan Silero VAD, cuma energy-based approximation.
-    """
+def find_silence_points(audio_bytes: bytes) -> list[float]:
+    """Cari titik senyap (saat) guna energy threshold ringkas."""
     points = []
     try:
         with av.open(io.BytesIO(audio_bytes)) as container:
             stream = container.streams.audio[0]
             resampler = av.AudioResampler(format="s16", layout="mono", rate=16000)
-            window_frames = int(16000 * 0.05)  # 50ms window
+            window_frames = int(16000 * 0.05)
             samples = []
             for frame in container.decode(stream):
                 for rframe in resampler.resample(frame):
                     arr = rframe.to_ndarray()
                     samples.extend(arr.flatten().tolist())
-            # Detect silence: window with RMS below threshold
-            threshold = 200  # s16 amplitude
+            threshold = 200
             for i in range(0, len(samples) - window_frames, window_frames):
-                window = samples[i:i+window_frames]
-                rms = (sum(s*s for s in window) / len(window)) ** 0.5
+                window = samples[i:i + window_frames]
+                rms = (sum(s * s for s in window) / len(window)) ** 0.5
                 if rms < threshold:
                     points.append(i / 16000.0)
     except Exception as e:
@@ -181,36 +169,26 @@ def find_silence_points(audio_bytes: bytes, min_silence_ms: int) -> list[float]:
     return points
 
 
-def chunk_audio(audio_bytes: bytes, chunk_seconds: float, silence_points: list[float]) -> list[tuple[float, float]]:
-    """Pecah audio kepada chunk (start, end) saat.
-    Cari titik senyap terdekat dengan chunk_seconds (sliding ±20%).
-    Jika tiada senyap, potong pada chunk_seconds.
-    """
-    duration = validate_audio(audio_bytes)
+def chunk_audio(duration: float, silence_points: list[float]) -> list[tuple[float, float]]:
+    """Pecah audio kepada chunk (start, end). Sliding pada senyap ±20%."""
     chunks = []
     start = 0.0
     while start < duration:
-        target_end = start + chunk_seconds
+        target_end = start + CHUNK_SECONDS
         if target_end >= duration:
             chunks.append((start, duration))
             break
-        # Cari senyap terdekat dalam julat [target_end - 0.2*chunk, target_end + 0.2*chunk]
-        lo = target_end - 0.2 * chunk_seconds
-        hi = target_end + 0.2 * chunk_seconds
+        lo = target_end - 0.2 * CHUNK_SECONDS
+        hi = target_end + 0.2 * CHUNK_SECONDS
         candidates = [p for p in silence_points if lo <= p <= hi]
-        if candidates:
-            # Pilih senyap paling hampir dengan target_end
-            best = min(candidates, key=lambda p: abs(p - target_end))
-            end = best
-        else:
-            end = target_end
+        end = min(candidates, key=lambda p: abs(p - target_end)) if candidates else target_end
         chunks.append((start, end))
         start = end
     return chunks
 
 
 def extract_chunk(audio_bytes: bytes, start: float, end: float) -> bytes:
-    """Extract chunk dari audio bytes sebagai WAV 16kHz mono."""
+    """Extract chunk sebagai WAV 16kHz mono (dalam memori)."""
     out = io.BytesIO()
     try:
         with av.open(io.BytesIO(audio_bytes)) as container:
@@ -238,7 +216,6 @@ def extract_chunk(audio_bytes: bytes, start: float, end: float) -> bytes:
 
 
 def apply_confidence_gate(segments: list) -> tuple[list, int]:
-    """Buang segmen yang no_speech_prob > max DAN avg_logprob < min."""
     if not GATE_ENABLED:
         return segments, 0
     kept = []
@@ -254,23 +231,20 @@ def apply_confidence_gate(segments: list) -> tuple[list, int]:
 
 
 def apply_repetition_guard(text: str) -> tuple[str, int]:
-    """Potong frasa berulang >max_repeats berturut-turut."""
     if not REP_ENABLED:
         return text, 0
-    # Cari frasa (1-5 perkataan) berulang >REP_MAX kali berturut
     pattern = re.compile(r'(\b(?:\w+\s+){0,4}\w+\b)(?:\s+\1){' + str(REP_MAX) + r',}', re.IGNORECASE)
     trimmed = 0
     def repl(m):
         nonlocal trimmed
         trimmed += 1
         return m.group(1)
-    new_text = pattern.sub(repl, text)
-    return new_text, trimmed
+    return pattern.sub(repl, text), trimmed
 
 
 def transcribe_one(audio_bytes: bytes, language: str, task: str,
                    word_timestamps: bool, initial_prompt: str, vad_threshold: float):
-    """Transkrip satu blob audio (satu chunk atau audio penuh). Pulang (text, info, segments)."""
+    """Transkrip satu blob audio. Pulang (text, info, segments)."""
     segs, info = model.transcribe(
         io.BytesIO(audio_bytes),
         beam_size=BEAM_SIZE,
@@ -282,7 +256,7 @@ def transcribe_one(audio_bytes: bytes, language: str, task: str,
         word_timestamps=word_timestamps,
         initial_prompt=initial_prompt if initial_prompt else None,
     )
-    segs_list = list(segs)  # force evaluation
+    segs_list = list(segs)
     text = " ".join(s.text.strip() for s in segs_list)
     return text, info, segs_list
 
@@ -299,6 +273,7 @@ async def transcribe(
     word_timestamps: bool = Query(None),
     initial_prompt: str = Query(None),
     vad_threshold: float = Query(None),
+    max_duration: float = Query(None),
 ):
     req_id = uuid.uuid4().hex[:12]
     t0 = time.time()
@@ -313,20 +288,21 @@ async def transcribe(
     gated_total = 0
     rep_trimmed_total = 0
     audio_duration = 0.0
+    all_segs = []
+    sem = None
 
-    # Baca fail
+    # 1) Baca fail
     try:
         audio_bytes = await file.read()
         size = len(audio_bytes)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"gagal baca fail: {e}")
-
     if size == 0:
         raise HTTPException(status_code=400, detail="fail kosong")
     if size > MAX_FILE_BYTES:
         raise HTTPException(status_code=413, detail=f"fail terlalu besar: {size} bytes (max {MAX_FILE_BYTES})")
 
-    # Validasi audio (PyAV)
+    # 2) Validasi audio
     try:
         audio_duration = validate_audio(audio_bytes)
     except ValueError as e:
@@ -335,81 +311,118 @@ async def transcribe(
                     "status": "invalid_audio", "error_type": "Validation", "error_msg": str(e)})
         raise HTTPException(status_code=400, detail=str(e))
 
-    # Parameter
+    # 3) Parameter
     wt = WORD_TS_DEFAULT if word_timestamps is None else word_timestamps
     vt = VAD_THRESHOLD if vad_threshold is None else vad_threshold
+    md = MAX_DURATION_DEFAULT if max_duration is None else max_duration
 
-    # Queue
-    acquired = _queue_sem.locked()
-    if acquired:
-        got = False
-        try:
-            got = await asyncio.wait_for(_queue_sem.acquire(), timeout=0.001)
-        except (asyncio.TimeoutError, Exception):
-            got = False
-        if not got:
-            _write_log({"ts": datetime.now(timezone.utc).isoformat(), "version": VERSION,
-                        "request_id": req_id, "file": file.filename, "size": size,
-                        "status": "rejected_queue_full", "duration": round(time.time() - t0, 3)})
-            raise HTTPException(status_code=429, detail="server busy, cuba lagi")
-    else:
-        await _queue_sem.acquire()
+    # 4) Semak max_duration (jika diberi): audio panjang ditolak awal
+    if md > 0 and audio_duration > md:
+        _write_log({"ts": datetime.now(timezone.utc).isoformat(), "version": VERSION,
+                    "request_id": req_id, "file": file.filename, "size": size,
+                    "status": "too_long", "audio_duration_s": round(audio_duration, 2),
+                    "max_duration_s": md})
+        raise HTTPException(status_code=413,
+                            detail=f"audio too long: {audio_duration:.1f}s > max {md}s")
+
+    # 5) Queue separation
+    is_fast = (md > 0 and audio_duration <= md)
+    sem = _fast_sem if is_fast else _slow_sem
+    gpu_timeout = FAST_GPU_TIMEOUT if is_fast else REQUEST_TIMEOUT
 
     try:
-        await asyncio.wait_for(_gpu_lock.acquire(), timeout=REQUEST_TIMEOUT)
+        if is_fast:
+            await asyncio.wait_for(sem.acquire(), timeout=FAST_GPU_TIMEOUT)
+        else:
+            await sem.acquire()
+    except asyncio.TimeoutError:
+        _write_log({"ts": datetime.now(timezone.utc).isoformat(), "version": VERSION,
+                    "request_id": req_id, "file": file.filename, "size": size,
+                    "status": "rejected_queue_full", "duration": round(time.time() - t0, 3)})
+        raise HTTPException(status_code=429, detail="server busy, cuba lagi")
+
+    try:
+        # 6) Proses: chunking atau terus
         try:
-            # Tentukan chunk
             if CHUNK_ENABLED and audio_duration > CHUNK_SECONDS:
-                sil = find_silence_points(audio_bytes, MIN_SILENCE_MS)
-                chunk_ranges = chunk_audio(audio_bytes, CHUNK_SECONDS, sil)
+                sil = find_silence_points(audio_bytes)
+                chunk_ranges = chunk_audio(audio_duration, sil)
                 logger.info("Audio %.1fs → %d chunks", audio_duration, len(chunk_ranges))
-                all_segs = []
+                first_info = None
                 for idx, (cs, ce) in enumerate(chunk_ranges):
                     ct0 = time.time()
                     chunk_bytes = extract_chunk(audio_bytes, cs, ce)
                     if not chunk_bytes:
                         chunks_info.append({"idx": idx, "start": cs, "end": ce, "status": "skip"})
                         continue
-                    ctext, cinfo, csegs = transcribe_one(
-                        chunk_bytes, language, task, wt, initial_prompt or "", vt)
-                    # Adjust timestamps by offset
-                    for s in csegs:
-                        s.start += cs
-                        s.end += cs
-                        if wt and hasattr(s, "words"):
-                            for w in s.words:
+                    # GPU lock per chunk (release antara chunk)
+                    acquired = False
+                    try:
+                        await asyncio.wait_for(_gpu_lock.acquire(), timeout=CHUNK_TIMEOUT)
+                        acquired = True
+                    except asyncio.TimeoutError:
+                        chunks_info.append({"idx": idx, "start": cs, "end": ce,
+                                            "status": "gpu_timeout", "duration": round(time.time() - ct0, 2)})
+                        logger.warning("Chunk %d: GPU lock timeout", idx)
+                        continue
+                    try:
+                        ctext, cinfo, csegs = await asyncio.wait_for(
+                            asyncio.to_thread(transcribe_one, chunk_bytes, language, task, wt,
+                                              initial_prompt or "", vt),
+                            timeout=CHUNK_TIMEOUT,
+                        )
+                    except asyncio.TimeoutError:
+                        chunks_info.append({"idx": idx, "start": cs, "end": ce,
+                                            "status": "timeout", "duration": round(time.time() - ct0, 2)})
+                        logger.warning("Chunk %d timeout (%.1fs)", idx, CHUNK_TIMEOUT)
+                        continue
+                    finally:
+                        if acquired and _gpu_lock.locked():
+                            _gpu_lock.release()
+                    if first_info is None and cinfo is not None:
+                        first_info = cinfo
+                    for seg in csegs:
+                        seg.start += cs
+                        seg.end += cs
+                        if wt and hasattr(seg, "words"):
+                            for w in seg.words:
                                 w.start += cs
                                 w.end += cs
                     all_segs.extend(csegs)
                     chunks_info.append({"idx": idx, "start": cs, "end": ce,
                                         "status": "ok", "duration": round(time.time() - ct0, 2),
                                         "text_len": len(ctext)})
-                info = all_segs[0] if all_segs else None
-                # Gabung text (selepas gate & repetition guard di bawah)
-                text = " ".join(s.text.strip() for s in all_segs)
-                info_obj = cinfo if 'cinfo' in dir() else None
+                info = first_info
+                text = " ".join(seg.text.strip() for seg in all_segs)
             else:
-                text, info, all_segs = transcribe_one(audio_bytes, language, task, wt, initial_prompt or "", vt)
-                chunks_info.append({"idx": 0, "start": 0.0, "end": audio_duration, "status": "ok", "text_len": len(text)})
+                # Audio pendek: GPU lock untuk seluruh request
+                try:
+                    await asyncio.wait_for(_gpu_lock.acquire(), timeout=gpu_timeout)
+                except asyncio.TimeoutError:
+                    raise HTTPException(status_code=503, detail="GPU busy, cuba lagi")
+                try:
+                    text, info, all_segs = transcribe_one(
+                        audio_bytes, language, task, wt, initial_prompt or "", vt)
+                    chunks_info.append({"idx": 0, "start": 0.0, "end": audio_duration,
+                                        "status": "ok", "text_len": len(text)})
+                finally:
+                    if _gpu_lock.locked():
+                        _gpu_lock.release()
 
-            # Confidence gate
+            # 7) Post-process
             all_segs, gated_total = apply_confidence_gate(all_segs)
-            # Repetition guard
             text, rep_trimmed_total = apply_repetition_guard(text)
-
             status = "ok"
-        except asyncio.TimeoutError:
-            error_type = "Timeout"
-            error_msg = f"transkripsi melebihi {REQUEST_TIMEOUT}s"
-            raise HTTPException(status_code=504, detail=error_msg)
+
+        except HTTPException:
+            raise
         except Exception as e:
             error_type = type(e).__name__
             error_msg = str(e)
             raise HTTPException(status_code=500, detail=error_msg)
-        finally:
-            _gpu_lock.release()
+
     finally:
-        _queue_sem.release()
+        sem.release()
         vram_after = _vram_mb()
         _write_log({
             "ts": datetime.now(timezone.utc).isoformat(),
@@ -420,6 +433,7 @@ async def transcribe(
             "language": language,
             "task": task,
             "status": status,
+            "queue": "fast" if is_fast else "slow",
             "duration": round(time.time() - t0, 3),
             "audio_duration_s": round(audio_duration, 2),
             "chunks": chunks_info,
@@ -453,10 +467,13 @@ def health():
         "status": "ok",
         "version": VERSION,
         "config": {
-            "max_file_mb": MAX_FILE_BYTES // (1024*1024),
+            "max_file_mb": MAX_FILE_BYTES // (1024 * 1024),
             "timeout_s": int(REQUEST_TIMEOUT),
             "chunk_seconds": int(CHUNK_SECONDS),
             "chunk_enabled": CHUNK_ENABLED,
+            "chunk_timeout_s": int(CHUNK_TIMEOUT),
             "queue_max": QUEUE_MAX,
+            "max_duration_s": int(MAX_DURATION_DEFAULT),
+            "fast_gpu_timeout_s": int(FAST_GPU_TIMEOUT),
         },
     }
