@@ -39,3 +39,4 @@ Thumbs.db
 .vscode/
 *.swp
 fat/test.sh
+*.bak*
