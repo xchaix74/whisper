@@ -8,10 +8,12 @@ Varian **fat** versi 1.1.0 — faster-whisper large-v3-turbo, float16, GPU sm_12
 
 | Ciri | 1.0.0 | 1.1.0 |
 |---|---|---|
-| Audio ≤10 minit | ✅ | ✅ |
-| Audio >10 minit | ❌ timeout | ✅ **Chunking automatik** |
 | Had saiz fail | 100MB | **2GB** |
-| Timeout | 120s | **900s** |
+| Audio ≤5 minit | ✅ | ✅ (sama) |
+| Audio 5-30 minit | ✅ (jika <100MB) | ✅ (chunking, sedikit overhed) |
+| Audio >100MB (cth 1j 57m, 109MB) | ❌ **HTTP 413** | ✅ **Chunking automatik** |
+| Audio >30 minit (bahasa padat: ta, th) | ⚠️ timeout 120s | ⚠️ **lambat (10-15 minit)**, tetapi berjaya |
+| Timeout server | 120s | **900s** |
 | Confidence gate | ❌ | ✅ (buang segmen low-confidence) |
 | Repetition guard | ❌ | ✅ (potong frasa >3×) |
 | Validasi audio | ❌ (500 jika rosak) | ✅ **400 jika rosak** |
@@ -19,6 +21,30 @@ Varian **fat** versi 1.1.0 — faster-whisper large-v3-turbo, float16, GPU sm_12
 | `word_timestamps` | ❌ | ✅ (parameter) |
 | `initial_prompt` | ❌ | ✅ (parameter) |
 | `vad_threshold` | ❌ | ✅ (parameter) |
+
+## Nota penting (dari ujian brutal 2026-11-07)
+
+**1. Had sebenar 1.0.0 bukan "10 minit" — ia "100MB".**
+- Audio 13m 54s (13MB) → 1.0.0 berjaya (11s).
+- Audio 26m 17s (25MB) → 1.0.0 berjaya (26s).
+- Audio 1j 57m (109MB) → 1.0.0 **HTTP 413** (saiz >100MB).
+- Jadi 1.0.0 boleh proses audio panjang **selagi <100MB dan masa proses <120s**.
+
+**2. Bahasa padat (Tamil, Thai) lambat.**
+- Tamil 53m → 1.1.0 ambil ~12.8 minit (70s/chunk × 11 chunk), kerana VAD tiada senyap, setiap chunk penuh pertuturan.
+- Melayu 1j 57m → 1.1.0 ambil 86s (24 chunk, ~3.5s/chunk).
+- Ini **had model**, bukan kerosakan. Untuk CS real-time, guna audio <60s.
+
+**3. Queue boleh block.**
+- Jika audio panjang (53m) sedang proses, request baru (12s) menunggu dalam queue.
+- `queue_max=32` — sehingga 32 request boleh menunggu.
+- Untuk production CS, pertimbang `max_duration` parameter (akan datang 1.2.0) atau queue separation.
+
+**4. Teks beza 0.1-1% berbanding 1.0.0.**
+- Audio kecil (<60s): teks **sama** 100%.
+- Audio sederhana (1-10m): beza 2-7 aksara (0.1-0.5%).
+- Audio panjang (>10m): beza 4-132 aksara (0.5-1%).
+- Ini kerana chunking potong pada senyap berbeza. Kualiti keseluruhan sama.
 
 ## Ciri
 
@@ -30,6 +56,8 @@ Varian **fat** versi 1.1.0 — faster-whisper large-v3-turbo, float16, GPU sm_12
 - **Had saiz:** 2GB
 - **Timeout:** 900s (15 minit)
 - **Log:** JSONL di `/app/logs/whisper.jsonl` (tambah field `chunks`, `audio_duration_s`, `gated_segments`, `repetition_trimmed`)
+
+**Nota untuk CS:** Untuk CS real-time, guna audio <60s. Audio panjang (podcast, ceramah) adalah untuk batch/script, bukan CS interaktif. Jika CS hantar audio panjang, ia akan masuk queue dan boleh block request lain.
 
 ## Jalankan
 
